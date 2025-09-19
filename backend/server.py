@@ -44,6 +44,45 @@ class StatusCheckCreate(BaseModel):
     client_name: str
 
 
+# Car rating models
+class Car(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    make: str
+    model: str
+    year: int
+    image_url: str
+    hot_votes: int = 0
+    not_votes: int = 0
+    total_votes: int = 0
+    hot_percentage: float = 0.0
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class CarCreate(BaseModel):
+    make: str
+    model: str
+    year: int
+    image_url: str
+
+class CarResponse(BaseModel):
+    id: str
+    make: str
+    model: str
+    year: int
+    image_url: str
+    hot_votes: int
+    not_votes: int
+    total_votes: int
+    hot_percentage: float
+
+class VoteRequest(BaseModel):
+    car_id: str
+    vote_type: str  # "hot" or "not"
+
+class VoteResponse(BaseModel):
+    success: bool
+    car: CarResponse
+    message: str
+
 # AI agent models
 class ChatRequest(BaseModel):
     message: str
@@ -89,6 +128,226 @@ async def create_status_check(input: StatusCheckCreate):
 async def get_status_checks():
     status_checks = await db.status_checks.find().to_list(1000)
     return [StatusCheck(**status_check) for status_check in status_checks]
+
+# Car rating routes
+@api_router.get("/cars/random", response_model=CarResponse)
+async def get_random_car():
+    """Get a random car for rating"""
+    try:
+        # Get a random car from the database
+        pipeline = [{"$sample": {"size": 1}}]
+        cars = await db.cars.aggregate(pipeline).to_list(1)
+
+        if not cars:
+            raise HTTPException(status_code=404, detail="No cars found in database")
+
+        car = cars[0]
+        return CarResponse(
+            id=car["id"],
+            make=car["make"],
+            model=car["model"],
+            year=car["year"],
+            image_url=car["image_url"],
+            hot_votes=car["hot_votes"],
+            not_votes=car["not_votes"],
+            total_votes=car["total_votes"],
+            hot_percentage=car["hot_percentage"]
+        )
+
+    except Exception as e:
+        logger.error(f"Error getting random car: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get random car")
+
+@api_router.post("/cars/{car_id}/vote", response_model=VoteResponse)
+async def vote_for_car(car_id: str, vote_request: VoteRequest):
+    """Vote for a car as 'hot' or 'not'"""
+    try:
+        if vote_request.vote_type not in ["hot", "not"]:
+            raise HTTPException(status_code=400, detail="Vote type must be 'hot' or 'not'")
+
+        # Find the car
+        car = await db.cars.find_one({"id": car_id})
+        if not car:
+            raise HTTPException(status_code=404, detail="Car not found")
+
+        # Update vote counts
+        if vote_request.vote_type == "hot":
+            new_hot_votes = car["hot_votes"] + 1
+            new_not_votes = car["not_votes"]
+        else:
+            new_hot_votes = car["hot_votes"]
+            new_not_votes = car["not_votes"] + 1
+
+        new_total_votes = new_hot_votes + new_not_votes
+        new_hot_percentage = (new_hot_votes / new_total_votes * 100) if new_total_votes > 0 else 0
+
+        # Update the car in database
+        await db.cars.update_one(
+            {"id": car_id},
+            {
+                "$set": {
+                    "hot_votes": new_hot_votes,
+                    "not_votes": new_not_votes,
+                    "total_votes": new_total_votes,
+                    "hot_percentage": round(new_hot_percentage, 1)
+                }
+            }
+        )
+
+        # Return updated car data
+        updated_car = CarResponse(
+            id=car["id"],
+            make=car["make"],
+            model=car["model"],
+            year=car["year"],
+            image_url=car["image_url"],
+            hot_votes=new_hot_votes,
+            not_votes=new_not_votes,
+            total_votes=new_total_votes,
+            hot_percentage=round(new_hot_percentage, 1)
+        )
+
+        return VoteResponse(
+            success=True,
+            car=updated_car,
+            message=f"Vote recorded! This car is {updated_car.hot_percentage}% hot."
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error voting for car: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record vote")
+
+@api_router.post("/cars", response_model=CarResponse)
+async def create_car(car_data: CarCreate):
+    """Add a new car to the database"""
+    try:
+        car_dict = car_data.dict()
+        car_obj = Car(**car_dict)
+
+        # Insert into database
+        await db.cars.insert_one(car_obj.dict())
+
+        return CarResponse(
+            id=car_obj.id,
+            make=car_obj.make,
+            model=car_obj.model,
+            year=car_obj.year,
+            image_url=car_obj.image_url,
+            hot_votes=car_obj.hot_votes,
+            not_votes=car_obj.not_votes,
+            total_votes=car_obj.total_votes,
+            hot_percentage=car_obj.hot_percentage
+        )
+
+    except Exception as e:
+        logger.error(f"Error creating car: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create car")
+
+@api_router.post("/cars/initialize")
+async def initialize_cars():
+    """Initialize the database with sample car data"""
+    try:
+        # Check if cars already exist
+        existing_count = await db.cars.count_documents({})
+        if existing_count > 0:
+            return {"message": f"Database already has {existing_count} cars", "initialized": False}
+
+        # Sample car data with high-quality Unsplash images
+        sample_cars = [
+            {
+                "make": "Ferrari",
+                "model": "488 GTB",
+                "year": 2020,
+                "image_url": "https://images.unsplash.com/photo-1544636331-e26879cd4d9b?w=800&h=450&fit=crop&crop=center"
+            },
+            {
+                "make": "Lamborghini",
+                "model": "Huracan",
+                "year": 2021,
+                "image_url": "https://images.unsplash.com/photo-1563720223185-11003d516935?w=800&h=450&fit=crop&crop=center"
+            },
+            {
+                "make": "Porsche",
+                "model": "911 GT3",
+                "year": 2022,
+                "image_url": "https://images.unsplash.com/photo-1503376780353-7e6692767b70?w=800&h=450&fit=crop&crop=center"
+            },
+            {
+                "make": "McLaren",
+                "model": "720S",
+                "year": 2020,
+                "image_url": "https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=800&h=450&fit=crop&crop=center"
+            },
+            {
+                "make": "Bugatti",
+                "model": "Chiron",
+                "year": 2021,
+                "image_url": "https://images.unsplash.com/photo-1525609004556-c46c7d6cf023?w=800&h=450&fit=crop&crop=center"
+            },
+            {
+                "make": "Aston Martin",
+                "model": "DBS Superleggera",
+                "year": 2020,
+                "image_url": "https://images.unsplash.com/photo-1570618834314-ec2ec95d4d7c?w=800&h=450&fit=crop&crop=center"
+            },
+            {
+                "make": "BMW",
+                "model": "M4",
+                "year": 2021,
+                "image_url": "https://images.unsplash.com/photo-1555215695-3004980ad54e?w=800&h=450&fit=crop&crop=center"
+            },
+            {
+                "make": "Mercedes",
+                "model": "AMG GT",
+                "year": 2020,
+                "image_url": "https://images.unsplash.com/photo-1563707346-8d5c8dd7e63a?w=800&h=450&fit=crop&crop=center"
+            },
+            {
+                "make": "Audi",
+                "model": "R8",
+                "year": 2021,
+                "image_url": "https://images.unsplash.com/photo-1544636331-e26879cd4d9b?w=800&h=450&fit=crop&crop=center"
+            },
+            {
+                "make": "Tesla",
+                "model": "Model S Plaid",
+                "year": 2022,
+                "image_url": "https://images.unsplash.com/photo-1560958089-b8a1929cea89?w=800&h=450&fit=crop&crop=center"
+            },
+            {
+                "make": "Chevrolet",
+                "model": "Corvette C8",
+                "year": 2021,
+                "image_url": "https://images.unsplash.com/photo-1552519507-da3b142c6e3d?w=800&h=450&fit=crop&crop=center"
+            },
+            {
+                "make": "Ford",
+                "model": "Mustang Shelby GT500",
+                "year": 2020,
+                "image_url": "https://images.unsplash.com/photo-1494976688153-d4c7c48bbcdb?w=800&h=450&fit=crop&crop=center"
+            }
+        ]
+
+        # Create Car objects and insert into database
+        cars_to_insert = []
+        for car_data in sample_cars:
+            car_obj = Car(**car_data)
+            cars_to_insert.append(car_obj.dict())
+
+        # Bulk insert
+        result = await db.cars.insert_many(cars_to_insert)
+
+        return {
+            "message": f"Successfully initialized {len(result.inserted_ids)} cars",
+            "initialized": True,
+            "car_count": len(result.inserted_ids)
+        }
+
+    except Exception as e:
+        logger.error(f"Error initializing cars: {e}")
+        raise HTTPException(status_code=500, detail="Failed to initialize cars")
 
 
 # AI agent routes
